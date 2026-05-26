@@ -99,6 +99,8 @@ fun PhoneXApp() {
     val recordDuration by CallManager.recordingDurationSec.collectAsStateWithLifecycle()
     val dtmfKeys by CallManager.dtmfKeysPlayed.collectAsStateWithLifecycle()
     val simCarrier by CallManager.activeSimCarrier.collectAsStateWithLifecycle()
+    val recordingsList by CallManager.recordingsList.collectAsStateWithLifecycle()
+    val isAutoRecording by CallManager.isAutoRecording.collectAsStateWithLifecycle()
 
     // Dialer Number State
     var dialNumber by remember { mutableStateOf("") }
@@ -120,7 +122,8 @@ fun PhoneXApp() {
         Manifest.permission.ANSWER_PHONE_CALLS,
         Manifest.permission.RECORD_AUDIO,
         Manifest.permission.MODIFY_AUDIO_SETTINGS,
-        Manifest.permission.SEND_SMS
+        Manifest.permission.SEND_SMS,
+        "android.permission.POST_NOTIFICATIONS"
     )
 
     val permissionLauncher = rememberLauncherForActivityResult(
@@ -154,6 +157,7 @@ fun PhoneXApp() {
     LaunchedEffect(Unit) {
         permissionLauncher.launch(permissionsToRequest)
         isDefaultDialer = checkIsDefaultDialer(context)
+        CallManager.loadSettings(context)
         CallManager.detectActiveSimAndCarriers(context)
         contactsList = ContactRepository.fetchAllContacts(context)
         callLogsList = CallLogRepository.fetchCallLogs(context)
@@ -299,7 +303,8 @@ fun PhoneXApp() {
                         val items = listOf(
                             NavigationTabItem("DIALER", 0),
                             NavigationTabItem("HISTORY", 1),
-                            NavigationTabItem("CONTACTS", 2)
+                            NavigationTabItem("CONTACTS", 2),
+                            NavigationTabItem("SETTINGS", 3)
                         )
                         items.forEach { tab ->
                             val active = currentTab == tab.index
@@ -359,6 +364,7 @@ fun PhoneXApp() {
                     )
                     1 -> CallHistoryScreen(
                         logs = callLogsList,
+                        recordings = recordingsList,
                         onCallClick = { makeRealPhoneCall(context, it) },
                         onDeleteLog = { id ->
                             CallLogRepository.deleteCallLog(context, id)
@@ -367,6 +373,9 @@ fun PhoneXApp() {
                         onClearAll = {
                             CallLogRepository.clearAllLogs(context)
                             callLogsList = CallLogRepository.fetchCallLogs(context)
+                        },
+                        onDeleteRecording = { id ->
+                            CallManager.deleteRecording(id)
                         }
                     )
                     2 -> ContactsScreen(
@@ -380,6 +389,12 @@ fun PhoneXApp() {
                             } else {
                                 Toast.makeText(context, "Failed to save. Write permission required.", Toast.LENGTH_LONG).show()
                             }
+                        }
+                    )
+                    3 -> SettingsScreen(
+                        isAutoRecording = isAutoRecording,
+                        onAutoRecordingChange = { enabled ->
+                            CallManager.setAutoRecording(context, enabled)
                         }
                     )
                 }
@@ -713,141 +728,372 @@ fun DialKey(
 @Composable
 fun CallHistoryScreen(
     logs: List<PhoneXCallLog>,
+    recordings: List<CallRecording>,
     onCallClick: (String) -> Unit,
     onDeleteLog: (String) -> Unit,
-    onClearAll: () -> Unit
+    onClearAll: () -> Unit,
+    onDeleteRecording: (String) -> Unit
 ) {
+    var selectedSubTab by remember { mutableStateOf(0) } // 0 = Recent Calls, 1 = Audio Recordings
+    var currentlyPlayingId by remember { mutableStateOf<String?>(null) }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
             .padding(horizontal = 20.dp)
     ) {
+        // Dual Sub-Tabs Slider (Recent Calls | Secure Recordings)
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(vertical = 12.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
+                .padding(vertical = 8.dp)
+                .clip(RoundedCornerShape(14.dp))
+                .background(GlassOverlay)
+                .border(1.dp, GlassBorder, RoundedCornerShape(14.dp)),
+            horizontalArrangement = Arrangement.SpaceAround
         ) {
-            Text(
-                text = "RECENT CALLS",
-                fontSize = 16.sp,
-                fontWeight = FontWeight.Black,
-                fontFamily = FontFamily.Monospace,
-                color = CyberCyan
-            )
-
-            if (logs.isNotEmpty()) {
-                Text(
-                    text = "CLEAR ALL",
-                    fontSize = 11.sp,
-                    color = CyberMagenta,
-                    fontWeight = FontWeight.Black,
-                    fontFamily = FontFamily.Monospace,
-                    modifier = Modifier
-                        .clickable { onClearAll() }
-                        .padding(8.dp)
-                        .testTag("clear_all_logs_btn")
+            val tabs = listOf("RECIENTS", "CALL RECORDINGS")
+            tabs.forEachIndexed { index, title ->
+                val active = selectedSubTab == index
+                val colorAnimation by animateColorAsState(
+                    targetValue = if (active) CyberCyan else Color.White.copy(alpha = 0.5f),
+                    label = "sub_tab_color"
                 )
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(if (active) GlassTint else Color.Transparent)
+                        .clickable { selectedSubTab = index }
+                        .padding(vertical = 10.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = title,
+                        color = colorAnimation,
+                        fontSize = 11.sp,
+                        fontWeight = if (active) FontWeight.Black else FontWeight.Medium,
+                        fontFamily = FontFamily.Monospace,
+                        letterSpacing = 1.sp
+                    )
+                }
             }
         }
 
-        if (logs.isEmpty()) {
-            Box(
+        Spacer(modifier = Modifier.height(10.dp))
+
+        if (selectedSubTab == 0) {
+            // Recent Calls Block
+            Row(
                 modifier = Modifier
-                    .fillMaxSize()
-                    .weight(1f),
-                contentAlignment = Alignment.Center
+                    .fillMaxWidth()
+                    .padding(vertical = 6.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    text = "No call records. Connection logs cleared.",
-                    color = Color.White.copy(alpha = 0.4f),
-                    fontSize = 14.sp
+                    text = "CARRIER CHANNEL LOGS",
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Black,
+                    fontFamily = FontFamily.Monospace,
+                    color = CyberCyan
                 )
-            }
-        } else {
-            LazyColumn(
-                modifier = Modifier.weight(1f),
-                verticalArrangement = Arrangement.spacedBy(10.dp)
-            ) {
-                items(logs) { log ->
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(16.dp))
-                            .background(GlassTint)
-                            .border(1.dp, GlassBorder, RoundedCornerShape(16.dp))
-                            .padding(14.dp)
-                            .testTag("log_item_${log.id}")
-                    ) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Column(modifier = Modifier.weight(1f)) {
-                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                    // Simulated Call type Neon direction indicator
-                                    val typeText = when (log.type) {
-                                        1 -> "↙ INCOMING"
-                                        2 -> "↗ OUTGOING"
-                                        3 -> "❌ MISSED"
-                                        else -> "↙ REJECTED"
-                                    }
-                                    val typeColor = when (log.type) {
-                                        1 -> CyberGreen
-                                        2 -> CyberCyan
-                                        3 -> CyberMagenta
-                                        else -> CyberYellow
-                                    }
-                                    Text(
-                                        text = typeText,
-                                        fontSize = 10.sp,
-                                        color = typeColor,
-                                        fontWeight = FontWeight.Black,
-                                        modifier = Modifier.padding(end = 8.dp)
-                                    )
-                                }
-                                Spacer(modifier = Modifier.height(4.dp))
-                                Text(
-                                    text = log.name ?: log.number,
-                                    fontSize = 18.sp,
-                                    fontWeight = FontWeight.Bold,
-                                    color = Color.White
-                                )
-                                if (log.name != null) {
-                                    Text(
-                                        text = log.number,
-                                        fontSize = 12.sp,
-                                        color = GlassTranslucentText
-                                    )
-                                }
-                                Spacer(modifier = Modifier.height(4.dp))
-                                val format = SimpleDateFormat("MMM dd, hh:mm a", Locale.getDefault())
-                                Text(
-                                    text = "${format.format(Date(log.date))}  •  ${log.duration}s",
-                                    fontSize = 11.sp,
-                                    color = Color.White.copy(alpha = 0.4f)
-                                )
-                            }
 
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                IconButton(
-                                    onClick = { onCallClick(log.number) },
-                                    modifier = Modifier.testTag("dial_log_call_${log.id}")
-                                ) {
-                                    Text("📞", color = CyberGreen, fontSize = 20.sp)
+                if (logs.isNotEmpty()) {
+                    Text(
+                        text = "CLEAR ALL",
+                        fontSize = 11.sp,
+                        color = CyberMagenta,
+                        fontWeight = FontWeight.Black,
+                        fontFamily = FontFamily.Monospace,
+                        modifier = Modifier
+                            .clickable { onClearAll() }
+                            .padding(8.dp)
+                            .testTag("clear_all_logs_btn")
+                    )
+                }
+            }
+
+            if (logs.isEmpty()) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .weight(1f),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = "No call records. Connection logs cleared.",
+                        color = Color.White.copy(alpha = 0.4f),
+                        fontSize = 14.sp
+                    )
+                }
+            } else {
+                LazyColumn(
+                    modifier = Modifier.weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    items(logs) { log ->
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(16.dp))
+                                .background(GlassTint)
+                                .border(1.dp, GlassBorder, RoundedCornerShape(16.dp))
+                                .padding(14.dp)
+                                .testTag("log_item_${log.id}")
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        val typeText = when (log.type) {
+                                            1 -> "↙ INCOMING"
+                                            2 -> "↗ OUTGOING"
+                                            3 -> "❌ MISSED"
+                                            else -> "↙ REJECTED"
+                                        }
+                                        val typeColor = when (log.type) {
+                                            1 -> CyberGreen
+                                            2 -> CyberCyan
+                                            3 -> CyberMagenta
+                                            else -> CyberYellow
+                                        }
+                                        Text(
+                                            text = typeText,
+                                            fontSize = 10.sp,
+                                            color = typeColor,
+                                            fontWeight = FontWeight.Black,
+                                            modifier = Modifier.padding(end = 8.dp)
+                                        )
+                                    }
+                                    Spacer(modifier = Modifier.height(4.dp))
+                                    Text(
+                                        text = log.name ?: log.number,
+                                        fontSize = 18.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        color = Color.White
+                                    )
+                                    if (log.name != null) {
+                                        Text(
+                                            text = log.number,
+                                            fontSize = 12.sp,
+                                            color = GlassTranslucentText
+                                        )
+                                    }
+                                    Spacer(modifier = Modifier.height(4.dp))
+                                    val format = SimpleDateFormat("MMM dd, hh:mm a", Locale.getDefault())
+                                    Text(
+                                        text = "${format.format(Date(log.date))}  •  ${log.duration}s",
+                                        fontSize = 11.sp,
+                                        color = Color.White.copy(alpha = 0.4f)
+                                    )
                                 }
-                                IconButton(
-                                    onClick = { onDeleteLog(log.id) }
-                                ) {
-                                    Text("✕", color = CyberMagenta.copy(alpha = 0.6f), fontSize = 16.sp)
+
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    IconButton(
+                                        onClick = { onCallClick(log.number) },
+                                        modifier = Modifier.testTag("dial_log_call_${log.id}")
+                                    ) {
+                                        Text("📞", color = CyberGreen, fontSize = 20.sp)
+                                    }
+                                    IconButton(
+                                        onClick = { onDeleteLog(log.id) }
+                                    ) {
+                                        Text("✕", color = CyberMagenta.copy(alpha = 0.6f), fontSize = 16.sp)
+                                    }
                                 }
                             }
                         }
                     }
                 }
             }
+        } else {
+            // Secure Audio Recordings Block
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 6.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "SECURE BIOPHONIC RAW FILES",
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Black,
+                    fontFamily = FontFamily.Monospace,
+                    color = CyberMagenta
+                )
+            }
+
+            if (recordings.isEmpty()) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .weight(1f),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = "No audio recorded. Toggle RECORD during a call.",
+                        color = Color.White.copy(alpha = 0.4f),
+                        fontSize = 13.sp,
+                        textAlign = TextAlign.Center
+                    )
+                }
+            } else {
+                LazyColumn(
+                    modifier = Modifier.weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    items(recordings) { rec ->
+                        val isPlaying = currentlyPlayingId == rec.id
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(16.dp))
+                                .background(GlassTint)
+                                .border(
+                                    width = 1.dp,
+                                    color = if (isPlaying) CyberMagenta.copy(alpha = 0.6f) else GlassBorder,
+                                    shape = RoundedCornerShape(16.dp)
+                                )
+                                .clickable {
+                                    currentlyPlayingId = if (isPlaying) null else rec.id
+                                }
+                                .padding(14.dp)
+                        ) {
+                            Column {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = rec.callerNameOrNumber,
+                                            fontSize = 17.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            color = Color.White
+                                        )
+                                        Spacer(modifier = Modifier.height(2.dp))
+                                        val form = SimpleDateFormat("MMM dd, hh:mm a", Locale.getDefault())
+                                        Text(
+                                            text = "${form.format(Date(rec.timestamp))}  •  ${rec.durationSec}s",
+                                            fontSize = 11.sp,
+                                            color = Color.White.copy(alpha = 0.4f)
+                                        )
+                                    }
+
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        // Floating Action Core Indicators (Play state indicator icon)
+                                        IconButton(onClick = {
+                                            currentlyPlayingId = if (isPlaying) null else rec.id
+                                        }) {
+                                            Text(
+                                                text = if (isPlaying) "⏸" else "▶",
+                                                color = if (isPlaying) CyberMagenta else CyberCyan,
+                                                fontSize = 20.sp
+                                            )
+                                        }
+                                        IconButton(onClick = {
+                                            if (isPlaying) currentlyPlayingId = null
+                                            onDeleteRecording(rec.id)
+                                        }) {
+                                            Text("✕", color = Color.White.copy(alpha = 0.3f), fontSize = 16.sp)
+                                        }
+                                    }
+                                }
+
+                                // Interactive animated audio waveform!
+                                AnimatedVisibility(visible = isPlaying) {
+                                    Column(modifier = Modifier.padding(top = 10.dp)) {
+                                        Box(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .height(44.dp)
+                                                .clip(RoundedCornerShape(10.dp))
+                                                .background(Color.Black.copy(alpha = 0.5f))
+                                                .border(1.dp, CyberMagenta.copy(alpha = 0.3f), RoundedCornerShape(10.dp)),
+                                            contentAlignment = Alignment.Center
+                                        ) {
+                                            InteractivePlaybackWaveform()
+                                        }
+                                        Spacer(modifier = Modifier.height(6.dp))
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            horizontalArrangement = Arrangement.SpaceBetween,
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Text(
+                                                text = "ATMOSPHERIC DECRYPTION...",
+                                                color = CyberMagenta.copy(alpha = 0.8f),
+                                                fontSize = 9.sp,
+                                                fontFamily = FontFamily.Monospace,
+                                                fontWeight = FontWeight.Black
+                                            )
+                                            Text(
+                                                text = rec.audioPathSimulated,
+                                                color = Color.White.copy(alpha = 0.3f),
+                                                fontSize = 9.sp,
+                                                fontFamily = FontFamily.Monospace
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun InteractivePlaybackWaveform() {
+    val infiniteTransition = rememberInfiniteTransition(label = "playback_wave_anim")
+    val phase by infiniteTransition.animateFloat(
+        initialValue = 0f,
+        targetValue = 2f * Math.PI.toFloat(),
+        animationSpec = infiniteRepeatable(
+            animation = tween(2000, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "phase_val"
+    )
+
+    Canvas(modifier = Modifier.fillMaxSize().padding(horizontal = 14.dp)) {
+        val width = size.width
+        val height = size.height
+        val centerY = height / 2f
+        val points = 45
+        val step = width / points
+
+        for (layer in 0 until 3) {
+            val path = Path()
+            path.moveTo(0f, centerY)
+            val color = when (layer) {
+                0 -> CyberCyan
+                1 -> CyberMagenta.copy(alpha = 0.7f)
+                else -> CyberYellow.copy(alpha = 0.4f)
+            }
+            val amp = 12.dp.toPx() - (layer * 3.dp.toPx())
+            val freq = 0.08f + (layer * 0.03f)
+
+            for (i in 0..points) {
+                val x = i * step
+                val sinVal = kotlin.math.sin(i * freq - phase + (layer * 1.5f))
+                val y = centerY + sinVal * amp
+                path.lineTo(x, y)
+            }
+
+            drawPath(
+                path = path,
+                color = color,
+                style = Stroke(width = 1.6.dp.toPx())
+            )
         }
     }
 }
@@ -1495,38 +1741,77 @@ fun ActiveCallHudScreen(
 
 @Composable
 fun PulsingWaveAnimation(isActive: Boolean) {
-    val infiniteTransition = rememberInfiniteTransition(label = "pulse")
-    val radiusRatio by infiniteTransition.animateFloat(
-        initialValue = 0.7f,
-        targetValue = 1.3f,
+    if (!isActive) return
+
+    val infiniteTransition = rememberInfiniteTransition(label = "pulse_weave")
+    
+    val phase1 by infiniteTransition.animateFloat(
+        initialValue = 0f,
+        targetValue = 2f * Math.PI.toFloat(),
         animationSpec = infiniteRepeatable(
-            animation = tween(1800, easing = LinearOutSlowInEasing),
+            animation = tween(1400, easing = LinearEasing),
             repeatMode = RepeatMode.Restart
         ),
-        label = "radius"
+        label = "phase1"
     )
-    val waveAlpha by infiniteTransition.animateFloat(
-        initialValue = 0.8f,
-        targetValue = 0f,
+    val phase2 by infiniteTransition.animateFloat(
+        initialValue = 0f,
+        targetValue = -2f * Math.PI.toFloat(),
         animationSpec = infiniteRepeatable(
-            animation = tween(1800, easing = LinearOutSlowInEasing),
+            animation = tween(2200, easing = LinearEasing),
             repeatMode = RepeatMode.Restart
         ),
-        label = "alpha"
+        label = "phase2"
+    )
+    val scaleFactor by infiniteTransition.animateFloat(
+        initialValue = 0.9f,
+        targetValue = 1.15f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(1000, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "scale"
     )
 
     Canvas(modifier = Modifier.fillMaxSize()) {
-        val pulsingRadius = size.minDimension / 2 * radiusRatio
-        if (isActive) {
-            drawCircle(
-                color = CyberCyan.copy(alpha = waveAlpha),
-                radius = pulsingRadius,
-                style = Stroke(width = 1.dp.toPx())
-            )
-            drawCircle(
-                color = CyberCyan.copy(alpha = waveAlpha * 0.5f),
-                radius = pulsingRadius * 0.8f,
-                style = Stroke(width = 1.5.dp.toPx())
+        val centerX = size.width / 2f
+        val centerY = size.height / 2f
+        val baseRadius = size.minDimension / 2.3f * scaleFactor
+
+        for (waveIdx in 0 until 4) {
+            val path = Path()
+            val pointsCount = 120
+            val angleStep = (2 * Math.PI / pointsCount).toFloat()
+            val color = when (waveIdx) {
+                0 -> CyberGreen.copy(alpha = 0.8f)      // Primary voice peak
+                1 -> CyberCyan.copy(alpha = 0.6f)       // Technical overtone
+                2 -> CyberMagenta.copy(alpha = 0.4f)    // Sub-harmonic
+                else -> CyberYellow.copy(alpha = 0.3f)   // Dynamic resonance
+            }
+
+            val waveFreq = 4 + waveIdx * 2
+            val waveAmp = (8.dp.toPx() + waveIdx * 4.dp.toPx()) * (if (waveIdx % 2 == 0) 1 else -1)
+            val currentPhase = if (waveIdx % 2 == 0) phase1 else phase2
+
+            for (i in 0..pointsCount) {
+                val angle = i * angleStep
+                val voiceFluctuation = kotlin.math.sin(angle * waveFreq + currentPhase) * waveAmp
+                val radius = baseRadius + voiceFluctuation
+                val x = centerX + radius * kotlin.math.cos(angle)
+                val y = centerY + radius * kotlin.math.sin(angle)
+
+                if (i == 0) {
+                    path.moveTo(x, y)
+                } else {
+                    path.lineTo(x, y)
+                }
+            }
+            path.close()
+
+            drawPath(
+                path = path,
+                color = color,
+                style = Stroke(width = 2.dp.toPx())
             )
         }
     }
@@ -1657,5 +1942,159 @@ fun makeRealPhoneCall(context: Context, dialNumber: String) {
     } catch (e: Exception) {
         Log.e("PhoneX", "Error initiating telecom carrier call: ${e.message}")
         Toast.makeText(context, "Cellular error: ${e.message}", Toast.LENGTH_LONG).show()
+    }
+}
+
+@Composable
+fun SettingsScreen(
+    isAutoRecording: Boolean,
+    onAutoRecordingChange: (Boolean) -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(horizontal = 24.dp, vertical = 12.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        // App Identity Header
+        Spacer(modifier = Modifier.height(16.dp))
+        Box(
+            modifier = Modifier
+                .size(76.dp)
+                .clip(CircleShape)
+                .background(GlassTint)
+                .border(1.5.dp, CyberGreen, CircleShape),
+            contentAlignment = Alignment.Center
+        ) {
+            Text(
+                text = "R🪶",
+                color = CyberGreen,
+                fontSize = 32.sp,
+                fontWeight = FontWeight.Black
+            )
+        }
+        Spacer(modifier = Modifier.height(12.dp))
+        Text(
+            text = "RahuL Dialer Settings",
+            fontSize = 20.sp,
+            fontWeight = FontWeight.Bold,
+            color = Color.White
+        )
+        Text(
+            text = "Transparent Glassmorphic Engine v2.0",
+            fontSize = 11.sp,
+            color = GlassTranslucentText.copy(alpha = 0.6f),
+            fontFamily = FontFamily.Monospace
+        )
+
+        Spacer(modifier = Modifier.height(30.dp))
+
+        // Glass Card Settings Wrapper
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(24.dp))
+                .background(GlassOverlay)
+                .border(1.dp, GlassBorder, RoundedCornerShape(24.dp))
+                .padding(20.dp)
+        ) {
+            Column {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "🎙️",
+                        fontSize = 22.sp,
+                        modifier = Modifier.padding(end = 12.dp)
+                    )
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Automatic Call Recording",
+                            fontSize = 16.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = Color.White
+                        )
+                        Text(
+                            text = if (isAutoRecording) "Currently set to AUTOMATIC" else "Currently set to MANUAL",
+                            fontSize = 12.sp,
+                            color = if (isAutoRecording) CyberGreen else GlassTranslucentText
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(16.dp))
+
+                // Mode Selector Toggle
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(GlassTint)
+                        .border(1.dp, GlassBorder.copy(alpha = 0.5f), RoundedCornerShape(12.dp)),
+                    horizontalArrangement = Arrangement.SpaceAround
+                ) {
+                    val modes = listOf("MANUAL", "AUTOMATIC")
+                    modes.forEachIndexed { idx, mode ->
+                        val active = (idx == 0 && !isAutoRecording) || (idx == 1 && isAutoRecording)
+                        val colorAni by animateColorAsState(
+                            targetValue = if (active) CyberGreen else Color.White.copy(alpha = 0.5f),
+                            label = "setting_active"
+                        )
+                        Box(
+                            modifier = Modifier
+                                .weight(1f)
+                                .clip(RoundedCornerShape(10.dp))
+                                .background(if (active) Color.White.copy(alpha = 0.08f) else Color.Transparent)
+                                .clickable {
+                                    onAutoRecordingChange(idx == 1)
+                                }
+                                .padding(vertical = 12.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                text = mode,
+                                color = colorAni,
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold,
+                                fontFamily = FontFamily.Monospace,
+                                letterSpacing = 1.sp
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(16.dp))
+
+        // Info status panel
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(16.dp))
+                .background(GlassTint)
+                .border(1.dp, GlassBorder.copy(alpha = 0.3f), RoundedCornerShape(16.dp))
+                .padding(14.dp)
+        ) {
+            Text(
+                text = "When Automatic Call Recording is active, the system starts raw biophonic capture immediately upon call connection. Otherwise, recording can be manually controlled using the RECORD toggle in the call HUD.",
+                fontSize = 11.sp,
+                color = GlassTranslucentText.copy(alpha = 0.8f),
+                lineHeight = 16.sp
+            )
+        }
+
+        Spacer(modifier = Modifier.weight(1f))
+
+        // Bottom Brand
+        Text(
+            text = "DECRYPTED TELEPHONY SYSTEM BY RAHUL",
+            fontSize = 9.sp,
+            fontFamily = FontFamily.Monospace,
+            color = CyberGreen.copy(alpha = 0.6f),
+            letterSpacing = 2.sp
+        )
+        Spacer(modifier = Modifier.height(16.dp))
     }
 }

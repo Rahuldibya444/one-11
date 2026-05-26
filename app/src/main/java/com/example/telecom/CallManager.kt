@@ -1,6 +1,10 @@
 package com.example.telecom
 
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
 import android.content.Context
+import android.content.Intent
 import android.database.Cursor
 import android.media.MediaRecorder
 import android.net.Uri
@@ -9,6 +13,8 @@ import android.telecom.Call
 import android.telecom.CallAudioState
 import android.telephony.SubscriptionManager
 import android.util.Log
+import androidx.core.app.NotificationCompat
+import com.example.MainActivity
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -18,9 +24,15 @@ import java.io.IOException
 
 object CallManager {
     private const val TAG = "PhoneX_CallManager"
+    private const val CHANNEL_ID = "rahul_call_channel"
+    private const val NOTIFICATION_ID = 2605
     private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
     private var timerJob: Job? = null
     private var recordingTimerJob: Job? = null
+
+    // Preferences for Call Recording Options (Auto / Manual)
+    private val _isAutoRecording = MutableStateFlow(false)
+    val isAutoRecording: StateFlow<Boolean> = _isAutoRecording.asStateFlow()
 
     // Call state flows
     private val _currentCall = MutableStateFlow<Call?>(null)
@@ -62,6 +74,26 @@ object CallManager {
     private val _activeSimCarrier = MutableStateFlow("Primary SIM")
     val activeSimCarrier: StateFlow<String> = _activeSimCarrier.asStateFlow()
 
+    private val _recordingsList = MutableStateFlow<List<CallRecording>>(
+        listOf(
+            CallRecording(
+                id = "REC-P4",
+                callerNameOrNumber = "Caelum Vane",
+                timestamp = System.currentTimeMillis() - 7200000,
+                durationSec = 142,
+                audioPathSimulated = "rec_caelum.wav"
+            ),
+            CallRecording(
+                id = "REC-N9",
+                callerNameOrNumber = "Aurora Vance",
+                timestamp = System.currentTimeMillis() - 18000000,
+                durationSec = 67,
+                audioPathSimulated = "rec_aurora.wav"
+            )
+        )
+    )
+    val recordingsList: StateFlow<List<CallRecording>> = _recordingsList.asStateFlow()
+
     // Reference to the service to pass controls back
     var inCallService: PhoneCallService? = null
 
@@ -90,9 +122,32 @@ object CallManager {
             _currentCall.value = null
             _callStateValue.value = Call.STATE_DISCONNECTED
             stopTimer()
+            val recActive = _isRecording.value
+            val duration = _recordingDurationSec.value
             stopRecordingTimer()
             _isRecording.value = false
             _dtmfKeysPlayed.value = ""
+
+            inCallService?.let { dismissCallNotification(it) }
+
+            if (recActive && duration > 0) {
+                val recordId = "REC-" + java.util.UUID.randomUUID().toString().take(4).uppercase()
+                val numberOrName = if (_callerName.value.isNotEmpty() && _callerName.value != "Unknown Caller") {
+                    _callerName.value
+                } else if (_callerNumber.value.isNotEmpty()) {
+                    _callerNumber.value
+                } else {
+                    "Simulated Entry"
+                }
+                val newRecording = CallRecording(
+                    id = recordId,
+                    callerNameOrNumber = numberOrName,
+                    timestamp = System.currentTimeMillis(),
+                    durationSec = duration,
+                    audioPathSimulated = "rec_$recordId.wav"
+                )
+                _recordingsList.value = listOf(newRecording) + _recordingsList.value
+            }
         }
     }
 
@@ -106,12 +161,96 @@ object CallManager {
         val number = handleUri?.schemeSpecificPart ?: ""
         _callerNumber.value = number
 
+        val stateText = when (state) {
+            Call.STATE_DIALING -> "DIALING"
+            Call.STATE_CONNECTING -> "CONNECTING"
+            Call.STATE_ACTIVE -> "ACTIVE"
+            Call.STATE_HOLDING -> "HOLDING"
+            Call.STATE_RINGING -> "RINGING"
+            else -> "CONNECTED"
+        }
+
+        inCallService?.let { context ->
+            showCallNotification(context, stateText)
+        }
+
         if (state == Call.STATE_ACTIVE) {
             startTimer()
+            inCallService?.let { context ->
+                if (_isAutoRecording.value && !_isRecording.value) {
+                    toggleRecording(context)
+                }
+            }
         } else if (state == Call.STATE_DISCONNECTED) {
             stopTimer()
             stopRecordingTimer()
             _isRecording.value = false
+            inCallService?.let { dismissCallNotification(it) }
+        }
+    }
+
+    fun setAutoRecording(context: Context, enabled: Boolean) {
+        _isAutoRecording.value = enabled
+        val prefs = context.getSharedPreferences("rahul_settings", Context.MODE_PRIVATE)
+        prefs.edit().putBoolean("auto_recording", enabled).apply()
+    }
+
+    fun loadSettings(context: Context) {
+        val prefs = context.getSharedPreferences("rahul_settings", Context.MODE_PRIVATE)
+        _isAutoRecording.value = prefs.getBoolean("auto_recording", false)
+    }
+
+    fun showCallNotification(context: Context, stateText: String) {
+        try {
+            val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                val channel = NotificationChannel(
+                    CHANNEL_ID,
+                    "Active Calls & Recording",
+                    NotificationManager.IMPORTANCE_LOW
+                ).apply {
+                    description = "Displays status of active telephone channels"
+                }
+                notificationManager.createNotificationChannel(channel)
+            }
+
+            val launchIntent = Intent(context, MainActivity::class.java).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                putExtra("SHOW_CALL_SCREEN", true)
+            }
+            val pendingIntent = PendingIntent.getActivity(
+                context,
+                0,
+                launchIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+
+            val nameOrNum = _callerName.value.ifEmpty { _callerNumber.value.ifEmpty { "Active Channel" } }
+            val text = "Channel: $nameOrNum ($stateText)"
+            val subText = if (_isRecording.value) "🔴 Secure Recording: ${_recordingDurationSec.value}s" else "Connected"
+
+            val notification = NotificationCompat.Builder(context, CHANNEL_ID)
+                .setContentTitle("RahuL - Active Session")
+                .setContentText(text)
+                .setSubText(subText)
+                .setSmallIcon(android.R.drawable.sym_action_call)
+                .setContentIntent(pendingIntent)
+                .setOngoing(true)
+                .setOnlyAlertOnce(true)
+                .build()
+
+            notificationManager.notify(NOTIFICATION_ID, notification)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error posting notification: ${e.message}")
+        }
+    }
+
+    fun dismissCallNotification(context: Context) {
+        try {
+            val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            notificationManager.cancel(NOTIFICATION_ID)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error dismissing notification: ${e.message}")
         }
     }
 
@@ -184,15 +323,38 @@ object CallManager {
     // Audio Call Recording Simulation
     fun toggleRecording(context: Context) {
         if (_isRecording.value) {
+            val duration = _recordingDurationSec.value
             stopRecordingTimer()
             _isRecording.value = false
             Log.d(TAG, "Call recording stopped")
+            if (duration > 0) {
+                val recordId = "REC-" + java.util.UUID.randomUUID().toString().take(4).uppercase()
+                val numberOrName = if (_callerName.value.isNotEmpty() && _callerName.value != "Unknown Caller") {
+                    _callerName.value
+                } else if (_callerNumber.value.isNotEmpty()) {
+                    _callerNumber.value
+                } else {
+                    "Simulated Entry"
+                }
+                val newRecording = CallRecording(
+                    id = recordId,
+                    callerNameOrNumber = numberOrName,
+                    timestamp = System.currentTimeMillis(),
+                    durationSec = duration,
+                    audioPathSimulated = "rec_$recordId.wav"
+                )
+                _recordingsList.value = listOf(newRecording) + _recordingsList.value
+            }
         } else {
             _isRecording.value = true
             _recordingDurationSec.value = 0
             startRecordingTimer()
             Log.d(TAG, "Call recording started")
         }
+    }
+
+    fun deleteRecording(id: String) {
+        _recordingsList.value = _recordingsList.value.filter { it.id != id }
     }
 
     private fun startTimer() {
@@ -202,6 +364,10 @@ object CallManager {
                 while (true) {
                     delay(1000)
                     _callDurationSec.value = _callDurationSec.value + 1
+                    inCallService?.let { context ->
+                        val stateText = if (_isHeld.value) "HOLDING" else "ACTIVE - ${_callDurationSec.value}s"
+                        showCallNotification(context, stateText)
+                    }
                 }
             }
         }
@@ -218,6 +384,10 @@ object CallManager {
                 while (true) {
                     delay(1000)
                     _recordingDurationSec.value = _recordingDurationSec.value + 1
+                    inCallService?.let { context ->
+                        val stateText = if (_isHeld.value) "HOLDING" else "ACTIVE - ${_callDurationSec.value}s"
+                        showCallNotification(context, stateText)
+                    }
                 }
             }
         }
@@ -291,3 +461,11 @@ object CallManager {
         }
     }
 }
+
+data class CallRecording(
+    val id: String,
+    val callerNameOrNumber: String,
+    val timestamp: Long,
+    val durationSec: Int,
+    val audioPathSimulated: String
+)

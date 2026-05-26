@@ -3,6 +3,6 @@
     <item
         android:width="68dp"
         android:height="68dp"
-        android:drawable="@drawable/phonex_icon_1779794195581"
+        android:drawable="@drawable/g_dialer_logo_1779796393448"
         android:gravity="center" />
 </layer-list>

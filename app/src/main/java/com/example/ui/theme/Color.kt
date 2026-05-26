@@ -13,7 +13,7 @@ val CyberGreen = Color(0xFF00E676)      // Connection/Active call
 val CyberYellow = Color(0xFFFFD600)     // Warning/OnHold
 
 // Glassmorphism translucent layer offsets
-val GlassTint = Color(0x0C00E5FF)       // 5% neon cyan tint
-val GlassBorder = Color(0x2B00E5FF)     // Thin cyber glowing boundary
-val GlassOverlay = Color(0xC8000000)    // High density dark backing
+val GlassTint = Color(0x55000000)       // 33% transparent pitch black glass tint
+val GlassBorder = Color(0x3B00E676)     // Thin glowing neon green boundary
+val GlassOverlay = Color(0xD8000000)    // High density pure black backdrop
 val GlassTranslucentText = Color(0xB3FFFFFF) // Sub text
